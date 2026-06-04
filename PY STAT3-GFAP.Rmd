@@ -1,0 +1,582 @@
+---
+title: "GFAP and PY-STAT3 analysis"
+output: html_document
+---
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE, results='asis', fig.width=10, fig.height=6}
+
+# ============================================================
+# Packages
+# ============================================================
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(car)
+library(ggpubr)
+library(officer)
+library(rvg)
+
+# ============================================================
+# Load Fiji CSV
+# ============================================================
+
+csv_file <- "/Users/antina/Desktop/LPS/IF4/GFAP_PYSTAT3_fixed20_REAL.csv"
+data <- read.csv(csv_file, check.names = FALSE)
+
+# Fix empty column names
+names(data)[is.na(names(data)) | names(data) == ""] <- paste0(
+  "empty_col_",
+  seq_len(sum(is.na(names(data)) | names(data) == ""))
+)
+
+# Remove completely empty columns
+data <- data[, colSums(!is.na(data)) > 0]
+
+# ============================================================
+# Output folders
+# ============================================================
+
+dir.create("R_results", showWarnings = FALSE)
+dir.create("R_results/plots", showWarnings = FALSE)
+dir.create("R_results/stats", showWarnings = FALSE)
+
+# ============================================================
+# Metadata extraction
+# Image format:
+# IF4-A1-HP-a-1
+# IF4 - animal - region - slice - Astro
+# ============================================================
+
+data_clean <- data %>%
+  mutate(
+    Image = as.character(Image),
+    Image_clean = Image %>%
+      str_remove("\\.tif$") %>%
+      str_remove("\\.tiff$")
+  ) %>%
+  separate(
+    Image_clean,
+    into = c("Experiment", "Animal", "Region", "Slice", "Astro"),
+    sep = "-",
+    remove = FALSE,
+    fill = "right"
+  ) %>%
+  mutate(
+    Condition = case_when(
+      Animal %in% c("A1", "A3", "A5") ~ "PBS",
+      Animal %in% c("A2", "A4", "A6") ~ "LPS",
+      TRUE ~ NA_character_
+    ),
+    Condition = factor(Condition, levels = c("PBS", "LPS")),
+    Region = factor(Region, levels = c("HP", "PFC", "ST")),
+    Animal = factor(Animal),
+    Astro = factor(Astro)
+  )
+
+# ============================================================
+# Long format
+# ============================================================
+
+long_data <- data_clean %>%
+  transmute(
+    Image,
+    Animal,
+    Region,
+    Slice,
+    Astro,
+    Condition,
+
+    GFAP_area = GFAP_pixel_count_ge_20,
+    GFAP_raw_intensity = GFAP_mean_all_pixels,
+    GFAP_thresholded_intensity = GFAP_mean_pixels_ge_20,
+    GFAP_intden = GFAP_intden_pixels_ge_20,
+
+    PY_STAT3_area = PY_STAT3_pixel_count_ge_20,
+    PY_STAT3_raw_intensity = PY_STAT3_mean_all_pixels,
+    PY_STAT3_thresholded_intensity = PY_STAT3_mean_pixels_ge_20,
+    PY_STAT3_intden = PY_STAT3_intden_pixels_ge_20
+  ) %>%
+  pivot_longer(
+    cols = c(
+      GFAP_area,
+      GFAP_raw_intensity,
+      GFAP_thresholded_intensity,
+      GFAP_intden,
+      PY_STAT3_area,
+      PY_STAT3_raw_intensity,
+      PY_STAT3_thresholded_intensity,
+      PY_STAT3_intden
+    ),
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Marker = case_when(
+      str_detect(Measure, "^GFAP") ~ "GFAP",
+      str_detect(Measure, "^PY_STAT3") ~ "PY-STAT3"
+    ),
+    Metric = case_when(
+      str_detect(Measure, "area") ~ "Area",
+      str_detect(Measure, "raw_intensity") ~ "Raw intensity",
+      str_detect(Measure, "thresholded_intensity") ~ "Thresholded intensity",
+      str_detect(Measure, "intden") ~ "Integrated density"
+    ),
+    Marker = factor(Marker, levels = c("GFAP", "PY-STAT3")),
+    Metric = factor(
+      Metric,
+      levels = c(
+        "Area",
+        "Raw intensity",
+        "Thresholded intensity",
+        "Integrated density"
+      )
+    )
+  ) %>%
+  filter(
+    !is.na(Value),
+    !is.na(Condition),
+    !is.na(Region),
+    !is.na(Animal)
+  )
+
+write.csv(
+  long_data,
+  "R_results/clean_long_data_GFAP_PYSTAT3.csv",
+  row.names = FALSE
+)
+
+# ============================================================
+# Colours
+# PBS = blue, LPS = red
+# Individual mice = shades of blue/red
+# ============================================================
+
+cond_colors <- c(
+  "PBS" = "#2E6CE6",
+  "LPS" = "#D62728"
+)
+
+mouse_colors <- c(
+  "A1" = "#9EC5FF",
+  "A3" = "#4F8CFF",
+  "A5" = "#003F9E",
+  "A2" = "#FFB0B0",
+  "A4" = "#E53935",
+  "A6" = "#8B0000"
+)
+
+# ============================================================
+# Statistics helpers
+# ============================================================
+
+p_to_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "ns",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+run_stats_region <- function(df) {
+
+  model <- lmer(value ~ condition + (1 | mouse/Astro), data = df)
+
+  tukey <- emmeans(model, pairwise ~ condition, adjust = "tukey")
+  tukey_df <- as.data.frame(tukey$contrasts)
+
+  pval <- tukey_df$p.value[1]
+
+  list(
+    model = model,
+    anova = anova(model),
+    tukey = tukey,
+    shapiro = shapiro.test(residuals(model)),
+    levene = car::leveneTest(value ~ condition, data = df),
+    p.value = pval,
+    p_label = p_to_stars(pval)
+  )
+}
+
+make_condition_annotations <- function(df) {
+
+  df %>%
+    group_by(region) %>%
+    group_modify(~ {
+
+      if (n_distinct(.x$condition) < 2) return(tibble())
+
+      stats <- run_stats_region(.x)
+
+      ymax <- max(.x$value, na.rm = TRUE)
+      ymin <- min(.x$value, na.rm = TRUE)
+      yrange <- ymax - ymin
+
+      if (yrange == 0) yrange <- ymax * 0.1
+      if (yrange == 0) yrange <- 1
+
+      tibble(
+        group1 = "PBS",
+        group2 = "LPS",
+        y.position = ymax + 0.15 * yrange,
+        p = stats$p.value,
+        p_label = stats$p_label
+      )
+    }) %>%
+    ungroup()
+}
+
+# ============================================================
+# Plot function
+# Design matched to previous analysis:
+# open violins, square mouse points, mean point, mean ± SE,
+# mouse legend, region facets, stars on plot.
+# ============================================================
+
+plot_violin_condition <- function(df, title_text, ylab_text, ann_df, show_mouse_legend = TRUE) {
+
+  ggplot(df, aes(x = condition, y = value)) +
+
+    geom_violin(
+      aes(color = condition),
+      fill = NA,
+      linewidth = 0.6,
+      trim = FALSE,
+      na.rm = TRUE
+    ) +
+
+    geom_point(
+      aes(color = mouse),
+      shape = 15,
+      size = 1.1,
+      alpha = 0.9,
+      position = position_jitter(width = 0.08),
+      na.rm = TRUE
+    ) +
+
+    stat_summary(
+      fun = mean,
+      geom = "point",
+      shape = 23,
+      size = 2.5,
+      fill = "white",
+      color = "black",
+      na.rm = TRUE
+    ) +
+
+    stat_summary(
+      fun.data = mean_se,
+      geom = "errorbar",
+      width = 0.12,
+      color = "black",
+      linewidth = 0.4,
+      na.rm = TRUE
+    ) +
+
+    stat_pvalue_manual(
+      ann_df,
+      label = "p_label",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      inherit.aes = FALSE,
+      tip.length = 0.01,
+      size = 5
+    ) +
+
+    facet_wrap(~ region, scales = "free_y") +
+
+    scale_color_manual(
+      values = c(cond_colors, mouse_colors),
+      breaks = names(mouse_colors)
+    ) +
+
+    theme_classic() +
+
+    theme(
+      legend.position = ifelse(show_mouse_legend, "right", "none"),
+      plot.title = element_text(hjust = 0.5),
+      strip.background = element_blank()
+    ) +
+
+    labs(
+      title = title_text,
+      x = NULL,
+      y = ylab_text,
+      color = "Mouse ID"
+    )
+}
+
+# ============================================================
+# Run analysis and create editable PowerPoint
+# ============================================================
+
+ppt <- read_pptx()
+
+for (marker_name in levels(long_data$Marker)) {
+
+  for (metric_name in levels(long_data$Metric)) {
+
+    df_plot <- long_data %>%
+      filter(Marker == marker_name, Metric == metric_name) %>%
+      rename(
+        mouse = Animal,
+        region = Region,
+        condition = Condition,
+        value = Value
+      ) %>%
+      mutate(
+        condition = factor(condition, levels = c("PBS", "LPS")),
+        region = factor(region, levels = c("HP", "PFC", "ST")),
+        mouse = factor(mouse, levels = c("A1", "A3", "A5", "A2", "A4", "A6"))
+      )
+
+    cat("\n\n##", marker_name, "-", metric_name, "\n\n")
+
+    ann_df <- make_condition_annotations(df_plot)
+
+    p <- plot_violin_condition(
+      df = df_plot,
+      title_text = paste(marker_name, "-", metric_name),
+      ylab_text = metric_name,
+      ann_df = ann_df,
+      show_mouse_legend = TRUE
+    )
+
+    print(p)
+
+    clean_name <- paste(marker_name, metric_name, sep = "_") %>%
+      str_replace_all(" ", "_") %>%
+      str_replace_all("-", "_")
+
+    ggsave(
+      filename = paste0("R_results/plots/", clean_name, ".pdf"),
+      plot = p,
+      width = 10,
+      height = 6
+    )
+
+    ggsave(
+      filename = paste0("R_results/plots/", clean_name, ".png"),
+      plot = p,
+      width = 10,
+      height = 6,
+      dpi = 300
+    )
+
+    ppt <- add_slide(ppt, layout = "Blank", master = "Office Theme")
+    ppt <- ph_with(
+      ppt,
+      dml(ggobj = p),
+      location = ph_location_fullsize()
+    )
+
+    for (region_name in levels(df_plot$region)) {
+
+      df_region <- df_plot %>%
+        filter(region == region_name)
+
+      if (nrow(df_region) == 0) next
+      if (n_distinct(df_region$condition) < 2) next
+
+      stats <- run_stats_region(df_region)
+
+      cat("\n\n### Region:", region_name, "\n\n")
+      cat("Model: `value ~ condition + (1 | mouse/Astro)`\n\n")
+
+      cat("\n#### Linear mixed model\n\n")
+      print(summary(stats$model))
+
+      cat("\n#### ANOVA\n\n")
+      print(stats$anova)
+
+      cat("\n#### Tukey post hoc\n\n")
+      print(stats$tukey)
+
+      cat("\n#### Shapiro test on residuals\n\n")
+      print(stats$shapiro)
+
+      cat("\n#### Levene test\n\n")
+      print(stats$levene)
+
+      stat_name <- paste(marker_name, metric_name, region_name, sep = "_") %>%
+        str_replace_all(" ", "_") %>%
+        str_replace_all("-", "_")
+
+      sink(paste0("R_results/stats/", stat_name, "_stats.txt"))
+
+      cat("Marker:", marker_name, "\n")
+      cat("Metric:", metric_name, "\n")
+      cat("Region:", region_name, "\n")
+      cat("Model: value ~ condition + (1 | mouse/Astro)\n\n")
+
+      cat("Linear mixed model\n")
+      print(summary(stats$model))
+
+      cat("\nANOVA\n")
+      print(stats$anova)
+
+      cat("\nTukey post hoc\n")
+      print(stats$tukey)
+
+      cat("\nShapiro test on residuals\n")
+      print(stats$shapiro)
+
+      cat("\nLevene test\n")
+      print(stats$levene)
+
+      sink()
+    }
+  }
+}
+# ============================================================
+# Extra plots:
+# PY-STAT3 raw + thresholded intensity
+# All regions pooled together: PBS vs LPS
+# ============================================================
+
+for (metric_name in c("Raw intensity", "Thresholded intensity")) {
+  
+  df_pooled <- long_data %>%
+    filter(
+      Marker == "PY-STAT3",
+      Metric == metric_name
+    ) %>%
+    rename(
+      mouse = Animal,
+      condition = Condition,
+      value = Value
+    ) %>%
+    mutate(
+      condition = factor(condition, levels = c("PBS", "LPS")),
+      mouse = factor(mouse, levels = c("A1", "A3", "A5", "A2", "A4", "A6"))
+    )
+  
+  model <- lmer(value ~ condition + (1 | mouse), data = df_pooled)
+  tukey <- emmeans(model, pairwise ~ condition, adjust = "tukey")
+  tukey_df <- as.data.frame(tukey$contrasts)
+  pval <- tukey_df$p.value[1]
+  
+  ymax <- max(df_pooled$value, na.rm = TRUE)
+  ymin <- min(df_pooled$value, na.rm = TRUE)
+  yrange <- ymax - ymin
+  if (yrange == 0) yrange <- 1
+  
+  ann_df <- tibble(
+    group1 = "PBS",
+    group2 = "LPS",
+    y.position = ymax + 0.15 * yrange,
+    p_label = p_to_stars(pval)
+  )
+  
+  p_pooled <- ggplot(df_pooled, aes(x = condition, y = value)) +
+    geom_violin(
+      aes(color = condition),
+      fill = NA,
+      linewidth = 0.6,
+      trim = FALSE,
+      na.rm = TRUE
+    ) +
+    geom_point(
+      aes(color = mouse),
+      shape = 15,
+      size = 1.1,
+      alpha = 0.9,
+      position = position_jitter(width = 0.08),
+      na.rm = TRUE
+    ) +
+    stat_summary(
+      fun = mean,
+      geom = "point",
+      shape = 23,
+      size = 2.5,
+      fill = "white",
+      color = "black",
+      na.rm = TRUE
+    ) +
+    stat_summary(
+      fun.data = mean_se,
+      geom = "errorbar",
+      width = 0.12,
+      color = "black",
+      linewidth = 0.4,
+      na.rm = TRUE
+    ) +
+    stat_pvalue_manual(
+      ann_df,
+      label = "p_label",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      inherit.aes = FALSE,
+      tip.length = 0.01,
+      size = 5
+    ) +
+    scale_color_manual(
+      values = c(cond_colors, mouse_colors),
+      breaks = names(mouse_colors)
+    ) +
+    theme_classic() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5),
+      strip.background = element_blank()
+    ) +
+    labs(
+      title = paste("PY-STAT3 -", metric_name, "- all regions pooled"),
+      x = NULL,
+      y = metric_name,
+      color = "Mouse ID"
+    )
+  
+  print(p_pooled)
+  
+  clean_name <- paste0(
+    "PY_STAT3_",
+    str_replace_all(metric_name, " ", "_"),
+    "_all_regions_pooled"
+  )
+  
+  ggsave(
+    filename = paste0("R_results/plots/", clean_name, ".pdf"),
+    plot = p_pooled,
+    width = 6,
+    height = 6
+  )
+  
+  ggsave(
+    filename = paste0("R_results/plots/", clean_name, ".png"),
+    plot = p_pooled,
+    width = 6,
+    height = 6,
+    dpi = 300
+  )
+  
+  ppt <- add_slide(ppt, layout = "Blank", master = "Office Theme")
+  ppt <- ph_with(
+    ppt,
+    dml(ggobj = p_pooled),
+    location = ph_location_fullsize()
+  )
+  
+  sink(paste0("R_results/stats/", clean_name, "_stats.txt"))
+  cat("PY-STAT3", metric_name, "all regions pooled\n")
+  cat("Model: value ~ condition + (1 | mouse)\n\n")
+  print(summary(model))
+  print(anova(model))
+  print(tukey)
+  print(shapiro.test(residuals(model)))
+  print(car::leveneTest(value ~ condition, data = df_pooled))
+  sink()
+}
+
+print(ppt, target = "R_results/GFAP_PYSTAT3_editable_plots.pptx")
+
+cat("\n\nEditable PowerPoint saved as: `R_results/GFAP_PYSTAT3_editable_plots.pptx`\n\n")
+cat("\n\nAll plots saved in: `R_results/plots/`\n\n")
+cat("\n\nAll stats saved in: `R_results/stats/`\n\n")
+```

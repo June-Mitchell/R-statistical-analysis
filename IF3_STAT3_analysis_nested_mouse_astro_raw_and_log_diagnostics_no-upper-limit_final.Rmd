@@ -1,0 +1,546 @@
+---
+title: "IF3 STAT3 analysis - vHP only"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggpubr)
+library(car)
+library(officer)
+library(rvg)
+
+options(emmeans.pbkrtest.limit = 0)
+options(emmeans.lmer.df = "asymptotic")
+
+theme_set(theme_classic(base_size = 13))
+
+data_dir <- "/Users/antina/Desktop/Chemo/images"
+
+nucleus_file <- file.path(data_dir, "IF1_nucleus_measurements.txt")
+endfeet_file <- file.path(data_dir, "IF1_endfeet_measurements.txt")
+process_file <- file.path(data_dir, "IF1_process_measurements.txt")
+vessel_file  <- file.path(data_dir, "IF1_vesselring_measurements.txt")
+diam_file    <- "/Users/antina/Desktop/Chemo/images/Tiff-files/vesselDiameter/vessel_diameter_master.tsv"
+
+fix_names <- function(df) {
+  bad <- names(df) == "" | is.na(names(df))
+  names(df)[bad] <- paste0("col_", seq_len(sum(bad)))
+  df
+}
+
+p_to_stars <- function(p) {
+  case_when(
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+make_mouse_colors <- function(df) {
+  mouse_map <- df %>%
+    distinct(mouse, condition) %>%
+    mutate(mouse = as.character(mouse), condition = as.character(condition))
+  
+  veh_mice <- mouse_map %>%
+    filter(condition == "VEH") %>%
+    pull(mouse) %>%
+    unique() %>%
+    sort()
+  
+  cno_mice <- mouse_map %>%
+    filter(condition == "CNO") %>%
+    pull(mouse) %>%
+    unique() %>%
+    sort()
+  
+  veh_cols <- if (length(veh_mice) > 0) {
+    setNames(colorRampPalette(c("#9ecae1", "#08519c"))(length(veh_mice)), veh_mice)
+  } else {
+    c()
+  }
+  
+  cno_cols <- if (length(cno_mice) > 0) {
+    setNames(colorRampPalette(c("#fcbba1", "#a50f15"))(length(cno_mice)), cno_mice)
+  } else {
+    c()
+  }
+  
+  c(
+    "VEH" = "#2166ac",
+    "CNO" = "#b2182b",
+    veh_cols,
+    cno_cols
+  )
+}
+
+plot_violin_condition <- function(df, yvar, title_text, ylab_text, ann_df) {
+  
+  my_cols <- make_mouse_colors(df)
+  
+  ggplot(df, aes(x = condition, y = .data[[yvar]])) +
+    geom_violin(
+      aes(color = condition),
+      fill = NA,
+      linewidth = 0.6,
+      trim = FALSE,
+      na.rm = TRUE
+    ) +
+    geom_point(
+      aes(color = mouse),
+      shape = 15,
+      size = 1.1,
+      alpha = 0.9,
+      position = position_jitter(width = 0.08),
+      na.rm = TRUE
+    ) +
+    stat_summary(
+      fun = mean,
+      geom = "point",
+      shape = 23,
+      size = 2.5,
+      fill = "white",
+      color = "black",
+      na.rm = TRUE
+    ) +
+    stat_summary(
+      fun.data = mean_se,
+      geom = "errorbar",
+      width = 0.12,
+      color = "black",
+      linewidth = 0.4,
+      na.rm = TRUE
+    ) +
+    ggpubr::stat_pvalue_manual(
+      ann_df,
+      label = "p_label",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      inherit.aes = FALSE,
+      tip.length = 0.01,
+      size = 5
+    ) +
+    scale_color_manual(values = my_cols) +
+    theme_classic() +
+    labs(title = title_text, x = NULL, y = ylab_text, color = "Mouse ID")
+}
+
+qq_band_plot <- function(x, title_text) {
+  ggpubr::ggqqplot(
+    data.frame(value = x),
+    x = "value",
+    conf.int = TRUE,
+    conf.int.fill = "grey80",
+    conf.int.alpha = 0.5,
+    title = title_text,
+    xlab = "Theoretical quantiles",
+    ylab = "Sample quantiles"
+  ) +
+    theme_classic()
+}
+
+safe_shapiro <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) >= 3 && length(x) <= 5000) {
+    shapiro.test(x)
+  } else {
+    message("Shapiro test skipped: needs 3-5000 finite values.")
+  }
+}
+
+run_analysis <- function(df, raw_var, trans_var, model_trans, title_text, trans_label = "log1p") {
+  
+  cat("\n\n==============================\n")
+  cat("Running:", title_text, "\n")
+  cat("raw_var:", raw_var, "\n")
+  cat("trans_var:", trans_var, "\n")
+  cat("Available columns:\n")
+  print(names(df))
+  cat("==============================\n\n")
+  
+  if (!raw_var %in% names(df)) {
+    stop(paste0("Missing raw_var column: ", raw_var, " in analysis: ", title_text))
+  }
+  
+  if (!trans_var %in% names(df)) {
+    stop(paste0("Missing trans_var column: ", trans_var, " in analysis: ", title_text))
+  }
+  
+  model_raw <- lmer(
+    as.formula(paste0(raw_var, " ~ condition + (1 | mouse/astro)")),
+    data = df,
+    REML = FALSE
+  )
+  
+  print(as.data.frame(VarCorr(model_trans)))
+  print(anova(model_trans))
+  
+  tuk <- as.data.frame(
+    emmeans(model_trans, pairwise ~ condition)$contrasts
+  )
+  print(tuk)
+  
+  y_max <- max(df[[raw_var]], na.rm = TRUE)
+  
+  ann <- tuk %>%
+    mutate(
+      group1 = "VEH",
+      group2 = "CNO",
+      p_label = p_to_stars(p.value),
+      y.position = y_max * 1.10
+    )
+  
+  p_condition <- plot_violin_condition(
+    df = df,
+    yvar = raw_var,
+    title_text = title_text,
+    ylab_text = title_text,
+    ann_df = ann
+  )
+  print(p_condition)
+  
+  print(
+    qq_band_plot(
+      residuals(model_raw),
+      paste("QQ plot before transformation -", title_text)
+    )
+  )
+  
+  print(
+    qq_band_plot(
+      residuals(model_trans),
+      paste("QQ plot after", trans_label, "transformation -", title_text)
+    )
+  )
+  
+  cat("\nShapiro test on raw-model residuals\n")
+  print(safe_shapiro(residuals(model_raw)))
+  
+  cat(paste0("\nShapiro test on ", trans_label, "-model residuals\n"))
+  print(safe_shapiro(residuals(model_trans)))
+  
+  cat("\nLevene test on raw values\n")
+  print(car::leveneTest(df[[raw_var]] ~ df$condition))
+  
+  cat(paste0("\nLevene test on ", trans_label, "-transformed values\n"))
+  print(car::leveneTest(df[[trans_var]] ~ df$condition))
+  
+  return(list(condition_plot = p_condition))
+}
+
+```
+
+```{r import_data}
+# =========================
+# Import data
+# =========================
+
+nucl <- read.delim(nucleus_file, check.names = FALSE, stringsAsFactors = FALSE)
+endf <- read.delim(endfeet_file, check.names = FALSE, stringsAsFactors = FALSE)
+proc <- read.delim(process_file, check.names = FALSE, stringsAsFactors = FALSE)
+vesr <- read.delim(vessel_file, check.names = FALSE, stringsAsFactors = FALSE)
+
+diam <- read.delim(
+  diam_file,
+  skip = 1,
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+nucl <- fix_names(nucl)
+endf <- fix_names(endf)
+proc <- fix_names(proc)
+vesr <- fix_names(vesr)
+diam <- fix_names(diam)
+
+names(nucl) <- tolower(names(nucl))
+names(endf) <- tolower(names(endf))
+names(proc) <- tolower(names(proc))
+names(vesr) <- tolower(names(vesr))
+names(diam) <- tolower(names(diam))
+
+nucl$image <- sub("-STAT3.*nuclear.*", "", nucl$label)
+endf$image <- sub("-STAT3.*endfeet.*", "", endf$label)
+proc$image <- sub("-STAT3.*process.*", "", proc$label)
+vesr$image <- sub("-STAT3.*vesselring.*", "", vesr$label)
+
+diam <- diam %>%
+  mutate(
+    image = trimws(gsub(".tif", "", image, fixed = TRUE)),
+    diameter = as.numeric(diameter)
+  )
+
+```
+
+```{r summaries}
+# =========================
+# Build summaries
+# =========================
+
+nuclear_summary <- nucl %>%
+  mutate(type = case_when(
+    grepl("-STAT3-nuclear$", label) ~ "raw",
+    grepl("-STAT3-thresholded-nuclear$", label) ~ "thr",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(type)) %>%
+  mutate(mean = as.numeric(mean)) %>%
+  group_by(image, type) %>%
+  summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = mean) %>%
+  rename(
+    nuclear_stat3_mean = raw,
+    nuclear_stat3_thr_mean = thr
+  )
+
+endfeet_summary <- endf %>%
+  mutate(type = case_when(
+    grepl("-STAT3-endfeet$", label) ~ "raw",
+    grepl("-STAT3-thresholded-endfeet$", label) ~ "thr",
+    grepl("-STAT3-area-endfeet$", label) ~ "area",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(type)) %>%
+  mutate(mean = as.numeric(mean), area = as.numeric(area)) %>%
+  group_by(image, type) %>%
+  summarise(
+    mean = mean(mean, na.rm = TRUE),
+    area = mean(area, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = type, values_from = c(mean, area)) %>%
+  rename(
+    endfeet_stat3_mean = mean_raw,
+    endfeet_stat3_thr_mean = mean_thr,
+    endfeet_stat3_area = area_area
+  )
+
+process_summary <- proc %>%
+  mutate(type = case_when(
+    grepl("-STAT3-process$", label) ~ "raw",
+    grepl("-STAT3-thresholded-process$", label) ~ "thr",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(type)) %>%
+  mutate(mean = as.numeric(mean)) %>%
+  group_by(image, type) %>%
+  summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = mean) %>%
+  rename(
+    process_stat3_mean = raw,
+    process_stat3_thr_mean = thr
+  )
+
+vessel_summary <- vesr %>%
+  mutate(type = case_when(
+    grepl("-STAT3-vesselring$", label) ~ "raw",
+    grepl("-STAT3-thresholded-vesselring$", label) ~ "thr",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(type)) %>%
+  mutate(mean = as.numeric(mean)) %>%
+  group_by(image, type) %>%
+  summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = mean) %>%
+  rename(
+    vessel_stat3_mean = raw,
+    vessel_stat3_thr_mean = thr
+  )
+
+
+```
+
+```{r tables}
+# =========================
+# Build analysis table
+# =========================
+
+meta <- tibble(
+  image = unique(c(
+    nuclear_summary$image,
+    endfeet_summary$image,
+    process_summary$image,
+    vessel_summary$image
+  ))
+) %>%
+  separate(
+    image,
+    into = c("condition", "mouse", "region", "slice", "astro"),
+    sep = "-",
+    remove = FALSE
+  )
+
+analysis_df <- meta %>%
+  left_join(diam %>% select(image, diameter), by = "image") %>%
+  left_join(nuclear_summary, by = "image") %>%
+  left_join(endfeet_summary, by = "image") %>%
+  left_join(process_summary, by = "image") %>%
+  left_join(vessel_summary, by = "image") %>%
+  mutate(
+    condition = factor(condition, levels = c("VEH", "CNO")),
+    mouse = factor(mouse),
+    slice = factor(slice),
+    astro = factor(astro),
+    
+    endfeet_nuclear_ratio = endfeet_stat3_thr_mean / nuclear_stat3_thr_mean,
+    process_nuclear_ratio = process_stat3_thr_mean / nuclear_stat3_thr_mean,
+    endfeet_process_ratio = endfeet_stat3_thr_mean / process_stat3_thr_mean,
+    
+    log_nuclear_stat3 = log1p(nuclear_stat3_mean),
+    log_endfeet_stat3 = log1p(endfeet_stat3_mean),
+    log_process_stat3 = log1p(process_stat3_mean),
+    log_vessel_stat3 = log1p(vessel_stat3_mean),
+    
+    log_endfeet_nuclear_ratio = log1p(endfeet_nuclear_ratio),
+    log_process_nuclear_ratio = log1p(process_nuclear_ratio),
+    log_endfeet_process_ratio = log1p(endfeet_process_ratio),
+    log_endfeet_stat3_area = log1p(endfeet_stat3_area),
+    sqrt_endfeet_nuclear_ratio = sqrt(endfeet_nuclear_ratio),
+    
+    log_diameter = log1p(diameter),
+    
+    stat3_total = endfeet_stat3_mean + nuclear_stat3_mean + process_stat3_mean,
+    nucleus_total_ratio = nuclear_stat3_mean / stat3_total,
+    endfeet_total_ratio = endfeet_stat3_mean / stat3_total,
+    log_stat3_total = log1p(stat3_total),
+    log_nucleus_total_ratio = log1p(nucleus_total_ratio),
+    sqrt_endfeet_total_ratio = sqrt(endfeet_total_ratio)
+  ) %>%
+  filter(!is.na(diameter), diameter <= 30)
+
+glimpse(analysis_df)
+
+```
+
+```{r datasets}
+
+# =========================
+# Separate datasets
+# =========================
+
+df_diameter <- analysis_df %>%
+  drop_na(diameter, log_diameter, condition, mouse, astro)
+
+df_nuclear <- analysis_df %>%
+  drop_na(nuclear_stat3_mean, log_nuclear_stat3, condition, mouse, astro)
+
+df_endfeet <- analysis_df %>%
+  drop_na(endfeet_stat3_mean, log_endfeet_stat3, condition, mouse, astro)
+
+df_process <- analysis_df %>%
+  drop_na(process_stat3_mean, log_process_stat3, condition, mouse, astro)
+
+df_vessel <- analysis_df %>%
+  drop_na(vessel_stat3_mean, log_vessel_stat3, condition, mouse, astro)
+
+df_ratio_en_sqrt <- analysis_df %>%
+  drop_na(endfeet_nuclear_ratio, sqrt_endfeet_nuclear_ratio, condition, mouse, astro)
+
+df_ratio_pn <- analysis_df %>%
+  drop_na(process_nuclear_ratio, log_process_nuclear_ratio, condition, mouse, astro)
+
+df_ratio_ep <- analysis_df %>%
+  drop_na(endfeet_process_ratio, log_endfeet_process_ratio, condition, mouse, astro)
+
+df_endfeet_area <- analysis_df %>%
+  drop_na(endfeet_stat3_area, log_endfeet_stat3_area, condition, mouse, astro)
+
+df_total <- analysis_df %>%
+  drop_na(stat3_total, log_stat3_total, condition, mouse, astro)
+
+df_ratio_nt <- analysis_df %>%
+  drop_na(nucleus_total_ratio, log_nucleus_total_ratio, condition, mouse, astro)
+
+df_ratio_et <- analysis_df %>%
+  drop_na(endfeet_total_ratio, sqrt_endfeet_total_ratio, condition, mouse, astro)
+
+cat("Rows retained:\n")
+cat("df_diameter:", nrow(df_diameter), "\n")
+cat("df_nuclear:", nrow(df_nuclear), "\n")
+cat("df_endfeet:", nrow(df_endfeet), "\n")
+cat("df_process:", nrow(df_process), "\n")
+cat("df_vessel:", nrow(df_vessel), "\n")
+cat("df_ratio_en_sqrt:", nrow(df_ratio_en_sqrt), "\n")
+cat("df_ratio_pn:", nrow(df_ratio_pn), "\n")
+cat("df_ratio_ep:", nrow(df_ratio_ep), "\n")
+cat("df_endfeet_area:", nrow(df_endfeet_area), "\n")
+cat("df_total:", nrow(df_total), "\n")
+cat("df_ratio_nt:", nrow(df_ratio_nt), "\n")
+cat("df_ratio_et:", nrow(df_ratio_et), "\n")
+
+```
+
+```{r models}
+# =========================
+# Fit models
+# Stats are done on LOG-transformed variables
+# =========================
+
+m_diameter <- lmer(log_diameter ~ condition + (1 | mouse/astro), data = df_diameter, REML = FALSE)
+m_nuclear <- lmer(log_nuclear_stat3 ~ condition + (1 | mouse/astro), data = df_nuclear, REML = FALSE)
+m_endfeet <- lmer(log_endfeet_stat3 ~ condition + (1 | mouse/astro), data = df_endfeet, REML = FALSE)
+m_process <- lmer(log_process_stat3 ~ condition + (1 | mouse/astro), data = df_process, REML = FALSE)
+m_vessel <- lmer(log_vessel_stat3 ~ condition + (1 | mouse/astro), data = df_vessel, REML = FALSE)
+m_ratio_en_sqrt <- lmer(sqrt_endfeet_nuclear_ratio ~ condition + (1 | mouse/astro), data = df_ratio_en_sqrt, REML = FALSE)
+m_ratio_pn <- lmer(log_process_nuclear_ratio ~ condition + (1 | mouse/astro), data = df_ratio_pn, REML = FALSE)
+m_ratio_ep <- lmer(log_endfeet_process_ratio ~ condition + (1 | mouse/astro), data = df_ratio_ep, REML = FALSE)
+m_endfeet_area <- lmer(log_endfeet_stat3_area ~ condition + (1 | mouse/astro), data = df_endfeet_area, REML = FALSE)
+m_total <- lmer(log_stat3_total ~ condition + (1 | mouse/astro), data = df_total, REML = FALSE)
+m_ratio_nt <- lmer(log_nucleus_total_ratio ~ condition + (1 | mouse/astro), data = df_ratio_nt, REML = FALSE)
+m_ratio_et <- lmer(sqrt_endfeet_total_ratio ~ condition + (1 | mouse/astro), data = df_ratio_et, REML = FALSE)
+
+```
+
+
+```{r results}
+
+diam_plots <- run_analysis(df_diameter, "diameter", "log_diameter", m_diameter, "Vessel diameter", "log1p")
+nuclear_plots <- run_analysis(df_nuclear, "nuclear_stat3_mean", "log_nuclear_stat3", m_nuclear, "Raw nuclear STAT3", "log1p")
+endfeet_plots <- run_analysis(df_endfeet, "endfeet_stat3_mean", "log_endfeet_stat3", m_endfeet, "Raw endfeet STAT3", "log1p")
+process_plots <- run_analysis(df_process, "process_stat3_mean", "log_process_stat3", m_process, "Raw process STAT3", "log1p")
+vessel_plots <- run_analysis(df_vessel, "vessel_stat3_mean", "log_vessel_stat3", m_vessel, "Raw vessel STAT3", "log1p")
+ratio_en_plots <- run_analysis(df_ratio_en_sqrt, "endfeet_nuclear_ratio", "sqrt_endfeet_nuclear_ratio", m_ratio_en_sqrt, "Endfeet STAT3 / Nuclear STAT3", "sqrt")
+ratio_pn_plots <- run_analysis(df_ratio_pn, "process_nuclear_ratio", "log_process_nuclear_ratio", m_ratio_pn, "Process STAT3 / Nuclear STAT3", "log1p")
+ratio_ep_plots <- run_analysis(df_ratio_ep, "endfeet_process_ratio", "log_endfeet_process_ratio", m_ratio_ep, "Endfeet STAT3 / Process STAT3", "log1p")
+endfeet_area_plots <- run_analysis(df_endfeet_area, "endfeet_stat3_area", "log_endfeet_stat3_area", m_endfeet_area, "Endfeet STAT3 area", "log1p")
+total_plots <- run_analysis(df_total, "stat3_total", "log_stat3_total", m_total, "Total STAT3", "log1p")
+ratio_nt_plots <- run_analysis(df_ratio_nt, "nucleus_total_ratio", "log_nucleus_total_ratio", m_ratio_nt, "Nucleus / Total STAT3", "log1p")
+ratio_et_plots <- run_analysis(df_ratio_et, "endfeet_total_ratio", "sqrt_endfeet_total_ratio", m_ratio_et, "Endfeet / Total STAT3", "sqrt")
+
+```
+
+```{r export_ppt}
+
+ppt <- read_pptx()
+
+add_plot_slide <- function(ppt, title, plot_obj) {
+  ppt <- add_slide(ppt, layout = "Title and Content", master = "Office Theme")
+  ppt <- ph_with(ppt, title, location = ph_location_type(type = "title"))
+  ppt <- ph_with(ppt, dml(ggobj = plot_obj), location = ph_location_fullsize())
+  ppt
+}
+
+ppt <- add_plot_slide(ppt, "Vessel diameter - condition comparison", diam_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Raw nuclear STAT3 - condition comparison", nuclear_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Raw endfeet STAT3 - condition comparison", endfeet_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Raw process STAT3 - condition comparison", process_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Raw vessel STAT3 - condition comparison", vessel_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Endfeet / Nuclear STAT3 - condition comparison", ratio_en_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Process / Nuclear STAT3 - condition comparison", ratio_pn_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Endfeet / Process STAT3 - condition comparison", ratio_ep_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Endfeet STAT3 area - condition comparison", endfeet_area_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Total STAT3 - condition comparison", total_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Nucleus / Total STAT3 - condition comparison", ratio_nt_plots$condition_plot)
+ppt <- add_plot_slide(ppt, "Endfeet / Total STAT3 - condition comparison", ratio_et_plots$condition_plot)
+
+print(ppt, target = file.path(data_dir, "IF3_STAT3_analysis_plots_editable.pptx"))
+
+```
